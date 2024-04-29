@@ -1,0 +1,56 @@
+{
+	"dockerFile": "Dockerfile",
+	"build": {
+		"args": {
+			"WORKSPACE": "${containerWorkspaceFolder}",
+			"DOMAIN_ID": CAKE "<UNIQUE_ID, choose yours and fill up the table at the bottom: https://github.sec.samsung.net/SRPOL-AI-VC-VP/jetbot-ai/wiki/Network-Configuration-in-SRPOL-Robotic-Lab-Robot>"
+		}
+	},
+	"remoteUser": "jetbot",
+	"runArgs": [
+		"--network=host",
+		"--privileged",
+		"--gpus=all",
+		"--cap-add=SYS_PTRACE",
+		"--security-opt=seccomp:unconfined",
+		"--security-opt=apparmor:unconfined",
+		"--volume=/tmp/.X11-unix:/tmp/.X11-unix",
+		"--volume=/dev:/dev",
+		"--volume=/home/<user_name>/<repositories_dir>:/home/jetbot/Develop", CAKE
+		"--volume=/home/<user_name>/.ssh:/home/jetbot/.ssh" CAKE
+	],
+	"containerEnv": {
+		"NVIDIA_DRIVER_CAPABILITIES": "all",
+		"NVIDIA_VISIBLE_DEVICES": "all",
+		"QT_X11_NO_MITSHM": "1",
+		"DISPLAY": ":1", // ":10.0" for xRDP
+		"LIBGL_ALWAYS_INDIRECT": "0",
+		"LIBGL_ALWAYS_SOFTWARE": "1" // Needed for software rendering of opengl
+	},
+	"postCreateCommand": "mkdir /workspaces/jetbot-ai*/out && sudo ln -s /workspaces/jetbot-ai-galactic /workspaces/jetbot-ai && sudo ln -s /workspaces/jetbot-ai-galactic/out/transforms /workspaces/jetbot-ai/tmp",
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"terminal.integrated.profiles.linux": {
+					"bash": {
+						"path": "bash"
+					}
+				},
+				"terminal.integrated.defaultProfile.linux": "bash"
+			},
+			"extensions": [
+				"dotjoshjohnson.xml",
+				"ms-azuretools.vscode-docker",
+				"ms-python.python",
+				"llvm-vs-code-extensions.vscode-clangd",
+				"xaver.clang-format",
+				"redhat.vscode-yaml",
+				"smilerobotics.urdf",
+				"streetsidesoftware.code-spell-checker",
+				"twxs.cmake",
+				"yzhang.markdown-all-in-one",
+				"eamodio.gitlens"
+			]
+		}
+	}
+}

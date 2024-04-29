@@ -1,3 +1,8 @@
+build
+install
+log
+out
+
 # Prerequisites
 *.d
 

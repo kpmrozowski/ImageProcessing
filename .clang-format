@@ -1,0 +1,27 @@
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 120
+
+AccessModifierOffset: -4
+ConstructorInitializerIndentWidth: 8
+
+AllowShortIfStatementsOnASingleLine: false
+AllowShortBlocksOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortLambdasOnASingleLine: Inline
+AllowShortFunctionsOnASingleLine: None
+
+AlignConsecutiveAssignments: false
+IndentPPDirectives: AfterHash
+
+DerivePointerAlignment: false
+PointerAlignment: Left
+
+IndentCaseLabels: true
+Cpp11BracedListStyle: true
+BreakConstructorInitializers: BeforeComma
+BreakInheritanceList: BeforeComma
+BreakBeforeTernaryOperators: true
+
+IncludeBlocks: Preserve
+

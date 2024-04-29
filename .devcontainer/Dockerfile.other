@@ -1,0 +1,9 @@
+FROM vsc-jetbot-ai-galactic-294dc9d08f132e3b69195a89e83d22929b6baf7e865a17f7871baeff241f67d6-uid:latest
+
+RUN sudo rm -f /etc/apt/sources.list.d/gazebo-stable.list &&\
+    sudo sh -c 'echo "deb http://packages.osrfoundation.org/gazebo/ubuntu-stable `lsb_release -cs` main" > /etc/apt/sources.list.d/gazebo-stable.list' &&\
+    wget https://packages.osrfoundation.org/gazebo.key -O - | sudo apt-key add - &&\
+    sudo apt update &&\
+    sudo apt install -y libignition-gazebo5* &&\
+    sudo apt autoremove -y &&\
+    python3 -m pip install pylibjpeg-libjpeg rosbags

@@ -1,0 +1,21 @@
+{
+    "key": "alt+u",                       // whatever keybinding you like
+    "command": "findInCurrentFile",
+    "args": {
+      "replace": [
+        "$${",
+          "return `${selectedText}`.replace(/[-\\s]/g, '_');",
+        "}$$"
+      ],
+      "restrictFind": "selections",       // only work on selections
+      "postCommands": "editor.action.transformToSnakecase"
+  
+      // for SCREAMING_SNAKE_CASE use the below
+      // "postCommands": ["editor.action.transformToSnakecase", "editor.action.transformToUppercase"]
+  
+    },
+    "snake": {
+        "prefix": "snake",
+        "body": "${TM_SELECTED_TEXT/([A-Z]{2,})(?=[A-Z][a-z]+[0-9]*|$)|([A-Z]?[a-z]+[0-9]*|[A-Z]|[0-9]+)([- _])?/${1:/downcase}${2:/downcase}${2:+_}/gm}"
+      },
+}

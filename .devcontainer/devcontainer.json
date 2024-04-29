@@ -1,0 +1,56 @@
+{
+	"dockerFile": "Dockerfile",
+	"build": {
+		"args": {
+			"WORKSPACE": "${containerWorkspaceFolder}",
+			"DOMAIN_ID": "19"
+		}
+	},
+	"remoteUser": "jetbot",
+	"runArgs": [
+		"--network=host",
+		"--privileged",
+		"--gpus=all",
+		"--cap-add=SYS_PTRACE",
+		"--security-opt=seccomp:unconfined",
+		"--security-opt=apparmor:unconfined",
+		"--volume=/tmp/.X11-unix:/tmp/.X11-unix",
+		"--volume=/dev:/dev",
+		"--volume=/home/k.mrozowski/dev:/home/jetbot/dev",
+		"--volume=/home/k.mrozowski/.ssh:/home/jetbot/.ssh"
+	],
+	"containerEnv": {
+		"NVIDIA_DRIVER_CAPABILITIES": "all",
+		"NVIDIA_VISIBLE_DEVICES": "all",
+		"QT_X11_NO_MITSHM": "1",
+		"DISPLAY": ":1", // ":10.0" for xRDP
+		"LIBGL_ALWAYS_INDIRECT": "0",
+		"LIBGL_ALWAYS_SOFTWARE": "1" // Needed for software rendering of opengl
+	},
+	"postCreateCommand": "",
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"terminal.integrated.profiles.linux": {
+					"bash": {
+						"path": "bash"
+					}
+				},
+				"terminal.integrated.defaultProfile.linux": "bash"
+			},
+			"extensions": [
+				"dotjoshjohnson.xml",
+				"ms-azuretools.vscode-docker",
+				"ms-python.python",
+				"llvm-vs-code-extensions.vscode-clangd",
+				  "xaver.clang-format",
+				"redhat.vscode-yaml",
+				"smilerobotics.urdf",
+				"streetsidesoftware.code-spell-checker",
+				"twxs.cmake",
+				"yzhang.markdown-all-in-one",
+				"eamodio.gitlens"
+			]
+		}
+	}
+}
