@@ -146,8 +146,8 @@ struct Rectification {
     cv::Mat gray_map_1;
     cv::Mat gray_map_2;
     cv::Mat new_intrinsics;
-    
-    Rectification();
+
+    Rectification() = default;
 
     Rectification(const cv::Size& resolution)
             : rgb_map_1(resolution, CV_32FC2)

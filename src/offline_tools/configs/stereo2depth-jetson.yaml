@@ -1,0 +1,42 @@
+%YAML 1.2
+---
+
+calibrationPath: "/workspaces/turtle/src/offline_tools/configs/calibration_2_jetson.json"
+topicRgb: "/jetson/color/compressed"
+topicStereoL: "/jetson/stereoL/compressed"
+topicStereoR: "/jetson/stereoR/compressed"
+compressed: true
+rgbWidth: 1280
+rgbHeight: 960
+stereoWidth: 640
+stereoHeight: 480
+verbose: true
+
+DepthGeneration:
+  computeColor: false
+  computeDepth: true
+  computeDisparity: true
+  computePointCloud: true
+  computeSLAM: false
+  useBilateralFilter: false
+  bilateralRadius: 5
+  bilateralIters: 16
+  useWlsFilter: false    # narrows the image from left margin by 1/3
+  stereoSGMMode: 1 # { 0: MODE_SGBM, 1: MODE_HH, 2: MODE_SGBM_3WAY, 3: MODE_HH4 }
+  depthPadding: 50
+
+SGM:
+  imgWidth: 640
+  imgHeight: 480
+  disparitySize: 128    # maximal_disparity (closest point)
+  p1: 11
+  p2: 120
+  uniqueness: 0.95
+  subpixel: true
+  numPaths: 8           # 8 or 4
+  minimalDisparity: 0
+  lrMaxDiff: 1          # maximum different hamming distance bits
+  censusTypeId: 1       # { 0: CENSUS_9x7, 1: SYMMETRIC_CENSUS_9x7 }
+
+ORB_SLAM3:
+  useGui: true

@@ -1,204 +1,398 @@
 #include "depth_generator/DepthGeneration.hpp"
 
-#include <filesystem>
+#include <functional>
+#include <iostream>
 
 #include <libsgm.h>
+#include <opencv2/core/hal/interface.h>
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
-#include <CLI/CLI.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/core/mat.hpp>
 #include <opencv2/cudastereo.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/ximgproc/disparity_filter.hpp>
+#include <opencv2/ximgproc/edge_filter.hpp>
+#include <string>
 
 #include "depth_generator/utils.hpp"
-#include "opencv2/imgproc.hpp"
 
 namespace tools {
 
-static const std::string kDefaultResultsPath = "/tmp/DepthGenerator/";
-
-DepthGeneration::DepthGeneration(int argc, char** argv) {
-    this->ParseOptions(argc, argv);
+DepthGeneration::DepthGeneration(const YAML::Node& cfg) : cfg_(cfg) {
     this->Init();
-}
-
-DepthGeneration::~DepthGeneration() {
-    if (!std::filesystem::is_directory({results_path_})) {
-        spdlog::warn("Output directory does not exist: {}", results_path_);
-        return;
-    }
-    if (std::filesystem::is_empty({results_path_})) {
-        spdlog::info("Output directory is empty. Removing: {}", results_path_);
-        utils::removeDirectory(results_path_);
-    } else {
-        spdlog::info("Output directory is not empty. See it's contents: {}", results_path_);
-    }
-}
-
-void DepthGeneration::ParseOptions(int argc, char** argv) {
-    CLI::App app{Name()};
-
-    app.add_option("--bag-dir", bag_dir_path_, "bag_dir_path_")->check(CLI::ExistingDirectory)->required();
-    app.add_option("--calib-file", calibration_path_, "calibration_path_")->check(CLI::ExistingFile)->required();
-    app.add_option("--cams", cameras_names_, "cameras name (used in calibration)")->required();
-    app.add_option("--topics", cameras_topics_, "cameras topics")->required();
-    app.add_option("--params-file", config_path_, "config_path_")->check(CLI::ExistingFile)->required();
-    app.add_option("--results-dir", output_directory_, "output_directory_")->check(CLI::ExistingDirectory);
-    app.add_flag("--verbose", verbose_, "verbose_");
-
-    try {
-        app.parse(argc, argv);
-    } catch (CLI::ParseError& e) {
-        std::exit(app.exit(e));
-    }
 }
 
 void DepthGeneration::Init() {
     bool success = false;
     size_t unsuccessful_runs = 0;
-    while (not success) {
-        spdlog::error("unsuccessful_runs: {}", unsuccessful_runs);
+    while (not success and unsuccessful_runs < 20) {
+        spdlog::info("unsuccessful_runs: {}", unsuccessful_runs);
         try {
-            PreparePaths();
-            LoadConfig();
-
-            spdlog::info("Creating sgm::StereoSGM");
-            sgm::StereoSGM ssgm = utils::CreateStereoSGM(cfg_);
-
-            spdlog::info("Creating BilateralFilter");
-            auto bilateral_filter =
-                cv::cuda::createDisparityBilateralFilter(cfg_["SGM"]["disparitySize"].as<int>(), 5, 2);
-
-            spdlog::info("Creating cv::cuda::StereoSGM");
-            cv::Ptr<cv::cuda::StereoSGM> cv_sgm_left = cv::cuda::createStereoSGM(
-                0, cfg_["SGM"]["disparitySize"].as<int>(), cfg_["SGM"]["p1"].as<int>(), cfg_["SGM"]["p2"].as<int>(),
-                100 * static_cast<int>(1.f - cfg_["SGM"]["uniqueness"].as<float>()), cv::cuda::StereoSGM::MODE_HH);
-            // cv_sgm_left->setPreFilterCap(cv::cuda::StereoBM::PREFILTER_XSOBEL);
-            auto wls_filter = cv::ximgproc::createDisparityWLSFilter(cv_sgm_left);
-            // wls_filter->setLambda(8000);
-            // wls_filter->setSigmaColor(2.0);
-            // wls_filter->setLRCthresh(consts->lrMaxDiff());
-            spdlog::info("StereoSGM created");
-
             // ====================================================================
             // ==================== Create PointCloudCollector ====================
 
-            calib_ = utils::LoadCalibration(calibration_path_);
-            rectification_ = utils::PerformRectification(calib_);
-            mapping_ = utils::PrepareImagesMapping(calib_);
+            spdlog::info("Loading CamSysCalib");
+            utils::LoadCalibration(calib_, cfg_["calibrationPath"].as<std::string>());
 
-            spdlog::info("Creating output directory: {}", results_path_);
-            utils::createDirectory(results_path_);
+            spdlog::info("Performing rectification");
+            utils::PerformRectification(rectification_, calib_, cfg_);
+
+            spdlog::info("Compute Projection Matrix");
+            mapping_ = utils::ComputeProjectionMatrix(calib_);
+
+            if (cfg_["DepthGeneration"]["computeDisparity"].as<bool>()) {
+                spdlog::info("Creating sgm::StereoSGM");
+                ssgm_ = std::make_unique<std::reference_wrapper<sgm::StereoSGM>>(utils::CreateStereoSGM(cfg_));
+            } else {
+                spdlog::info("please enable [DepthGeneration][computeDisparity]");
+                exit(0);
+            }
+
+            if (cfg_["DepthGeneration"]["computeDisparity"].as<bool>() &&
+                cfg_["DepthGeneration"]["useBilateralFilter"].as<bool>()) {
+                spdlog::info("Creating BilateralFilter...");
+                bilateral_filter_ = cv::cuda::createDisparityBilateralFilter(cfg_["SGM"]["disparitySize"].as<int>(),
+                                                                             cfg_["DepthGeneration"]["bilateralRadius"].as<int>(),
+                                                                             cfg_["DepthGeneration"]["bilateralIters"].as<int>());
+                spdlog::info("Created BilateralFilter");
+            }
+
+            if (cfg_["DepthGeneration"]["computeDisparity"].as<bool>() &&
+                cfg_["DepthGeneration"]["useWlsFilter"].as<bool>()) {
+                spdlog::info("Creating cv::cuda::StereoSGM...");
+                int stereo_sgm_mode = 0;
+
+                // clang-format off
+                switch (cfg_["DepthGeneration"]["stereoSGMMode"].as<int>()) {
+                    case 0: stereo_sgm_mode = cv::cuda::StereoSGM::MODE_SGBM; break;
+                    case 1: stereo_sgm_mode = cv::cuda::StereoSGM::MODE_HH; break;
+                    case 2: stereo_sgm_mode = cv::cuda::StereoSGM::MODE_SGBM_3WAY; break;
+                    case 3: stereo_sgm_mode = cv::cuda::StereoSGM::MODE_HH4; break;
+                    default: spdlog::error("invalid cfg[DepthGeneration][stereoSGMMode]"); exit(1);
+                }
+                cv::Ptr<cv::cuda::StereoSGM> cv_sgm_left = cv::cuda::createStereoSGM(
+                    0,
+                    cfg_["SGM"]["disparitySize"].as<int>(),
+                    cfg_["SGM"]["p1"].as<int>(), cfg_["SGM"]["p2"].as<int>(),
+                    100 * static_cast<int>(1.f - cfg_["SGM"]["uniqueness"].as<float>()),
+                    stereo_sgm_mode);
+                // clang-format on
+                spdlog::info("Created cv::cuda::StereoSGM");
+
+                spdlog::info("Creating cv::ximgproc::DisparityWLSFilter...");
+                // cv_sgm_left->setPreFilterCap(cv::cuda::StereoBM::PREFILTER_XSOBEL);
+                wls_filter_ = cv::ximgproc::createDisparityWLSFilter(cv_sgm_left);
+                spdlog::info("Created cv::ximgproc::DisparityWLSFilter");
+                // wls_filter_->setLambda(8000);
+                // wls_filter_->setSigmaColor(2.0);
+                // wls_filter_->setLRCthresh(consts->lrMaxDiff());
+            }
+            success = true;
         } catch (const std::exception& e) {
             ++unsuccessful_runs;
-            spdlog::info("unsuccessful_runs: {}", unsuccessful_runs);
+            spdlog::error("unsuccessful_runs: {}, what: {}", unsuccessful_runs, e.what());
             continue;
         }
         success = true;
     }
     spdlog::info("unsuccessful_runs: {}", unsuccessful_runs);
+
+    stereo_size_ = cv::Size{cfg_["stereoWidth"].as<int>(), cfg_["stereoHeight"].as<int>()};
+    sgm_size_ = cv::Size{cfg_["SGM"]["imgWidth"].as<int>(), cfg_["SGM"]["imgHeight"].as<int>()};
 }
 
-void DepthGeneration::PreparePaths() {
-    // determine dataset_path
-    std::filesystem::path dataset_path{bag_dir_path_ + "/"};
-    while (dataset_path.filename().empty()) {
-        dataset_path = dataset_path.parent_path();
+bool DepthGeneration::Compute(const cv::Mat& rgb_raw, const cv::Mat& stereoL_raw, const cv::Mat& stereoR_raw,
+                              cv::OutputArray& out_disparityL, cv::OutputArray& out_disparityR,
+                              cv::OutputArray& out_depthL, cv::OutputArray& out_depthR, Eigen::Matrix3Xf& out_cloud) {
+    if (rgb_raw.empty()) {
+        spdlog::warn("rgb_raw is empty");
+        return false;
     }
-    dataset_path += "/";
-
-    // determine results_path
-    const std::string dataset_name = dataset_path.parent_path().filename();
-    if (output_directory_.empty()) {
-        results_path_ = std::filesystem::path{kDefaultResultsPath} / dataset_name;
-    } else {
-        results_path_ = std::filesystem::path{output_directory_} / dataset_name;
+    if (stereoL_raw.empty()) {
+        spdlog::warn("stereoL_raw is empty");
+        return false;
     }
-    utils::DetermineResultsPath(results_path_);
-
-    // path configuration
-    spdlog::info("dataset_name: {}", dataset_name);
-    spdlog::info("dataset_path: {}", dataset_path.string());
-    spdlog::info("results_path: {}", results_path_);
-    spdlog::info("calibration_path: {}", calibration_path_);
-    spdlog::info("config_path: {}", config_path_);
-    spdlog::info("verbose: {}", verbose_);
-}
-
-void DepthGeneration::LoadConfig() {
-    spdlog::info("Loading Config");
-
-    cfg_ = YAML::LoadFile(config_path_);
-    spdlog::info("Loading {}", config_path_);
-    if (not cfg_["SGM"]["disparitySize"]) {
-        spdlog::warn("not cfg[SGM][disparitySize]");
+    if (stereoR_raw.empty()) {
+        spdlog::warn("stereoR_raw is empty");
+        return false;
     }
-    if (not cfg_["SGM"]["imgWidth"]) {
-        spdlog::warn("not cfg[SGM][imgWidth]");
-    }
-    if (not cfg_["SGM"]["imgHeight"]) {
-        spdlog::warn("not cfg[SGM][imgHeight]");
-    }
-    if (not cfg_["SGM"]["numPaths"]) {
-        spdlog::warn("not cfg[SGM][numPaths]");
-    }
-    if (not cfg_["SGM"]["censusTypeId"]) {
-        spdlog::warn("not cfg[SGM][censusTypeId]");
-    }
-    if (not cfg_["SGM"]["p1"]) {
-        spdlog::warn("not cfg[SGM][p1]");
-    }
-    if (not cfg_["SGM"]["p2"]) {
-        spdlog::warn("not cfg[SGM][p2]");
-    }
-    if (not cfg_["SGM"]["uniqueness"]) {
-        spdlog::warn("not cfg[SGM][uniqueness]");
-    }
-    if (not cfg_["SGM"]["subpixel"]) {
-        spdlog::warn("not cfg[SGM][subpixel]");
-    }
-    if (not cfg_["SGM"]["lrMaxDiff"]) {
-        spdlog::warn("not cfg[SGM][lrMaxDiff]");
-    }
-    if (not cfg_["DepthGeneration"]["computeColor"]) {
-        spdlog::warn("not cfg[DepthGeneration][computeColor]");
-    }
-    if (not cfg_["DepthGeneration"]["computeDepth"]) {
-        spdlog::warn("not cfg[DepthGeneration][computeDepth]");
-    }
-    if (not cfg_["DepthGeneration"]["computeDisparity"]) {
-        spdlog::warn("not cfg[DepthGeneration][computeDisparity]");
-    }
-    if (not cfg_["DepthGeneration"]["computePointCloud"]) {
-        spdlog::warn("not cfg[DepthGeneration][computePointCloud]");
-    }
-    if (not cfg_["DepthGeneration"]["computeSLAM"]) {
-        spdlog::warn("not cfg[DepthGeneration][computeSLAM]");
-    }
-    if (not cfg_["DepthGeneration"]["useBilateralFilter"]) {
-        spdlog::warn("not cfg[DepthGeneration][useBilateralFilter]");
-    }
-    if (not cfg_["DepthGeneration"]["bilateralRadius"]) {
-        spdlog::warn("not cfg[DepthGeneration][bilateralRadius]");
-    }
-    if (not cfg_["DepthGeneration"]["bilateralIters"]) {
-        spdlog::warn("not cfg[DepthGeneration][bilateralIters]");
-    }
-    if (not cfg_["DepthGeneration"]["useWlsFilter"]) {
-        spdlog::warn("not cfg[DepthGeneration][useWlsFilter]");
-    }
-    if (not cfg_["DepthGeneration"]["depthPadding"]) {
-        spdlog::warn("not cfg[DepthGeneration][depthPadding]");
-    }
-}
-
-bool DepthGeneration::Compute(const cv::Mat& rgb_raw, const cv::Mat& ir1_raw, const cv::Mat& ir2_raw,
-                              cv::Mat& out_disparity, cv::Mat& out_depth, cv::Mat& out_cloud) {
     cv::Mat color_img, rgb_rect, stereoL_rect, stereoR_rect, fpv_undis, stereoL_undis, stereoR_undis;
-    
+
+    auto start_rectify = std::chrono::high_resolution_clock::now();
+    auto start_disparity = std::chrono::high_resolution_clock::now();
+    auto start_point_cloud = std::chrono::high_resolution_clock::now();
+
+    auto duration_rectify = std::chrono::duration<double, std::milli>();
+    auto duration_disparity = std::chrono::duration<double, std::milli>();
+    auto duration_point_cloud = std::chrono::duration<double, std::milli>();
+
     if (cfg_["DepthGeneration"]["computeColor"].as<bool>()) {
         cv::undistort(rgb_raw, fpv_undis, calib_.rgb.intrinsics, calib_.rgb.distortion);
         cv::remap(fpv_undis, rgb_rect, rectification_.rgb_map_1, rectification_.rgb_map_2, cv::INTER_LINEAR);
     }
+    start_rectify = std::chrono::high_resolution_clock::now();
+    cv::undistort(stereoL_raw, stereoL_undis, calib_.stereoL_rect.intrinsics, calib_.stereoL_rect.distortion);
+    cv::remap(stereoL_undis, stereoL_rect, rectification_.gray_map_1, rectification_.gray_map_2, cv::INTER_LINEAR);
+
+    cv::undistort(stereoR_raw, stereoR_undis, calib_.stereoR_rect.intrinsics, calib_.stereoR_rect.distortion);
+
+    cv::remap(stereoR_undis, stereoR_rect, rectification_.gray_map_1, rectification_.gray_map_2, cv::INTER_LINEAR);
+    duration_rectify = std::chrono::high_resolution_clock::now() - start_rectify;
+
+    // compute disparity
+    start_disparity = std::chrono::high_resolution_clock::now();
+    cv::Mat disparityL, disparityR, filtered_dispL, filtered_dispR;
+    cv::cuda::GpuMat d_filtered_dispL, d_filtered_dispR;
+    // cv::cuda::GpuMat d_stereoL_rect(stereoL_rect), d_stereoR_rect(stereoR_rect), d_disparityL, d_disparityR;
+    if (cfg_["DepthGeneration"]["computeDisparity"].as<bool>()) {
+        try {
+            // fmt::print("ComputeDisparity start\n");
+            cv::Mat stereoL_resized, stereoR_resized, disparityL_resized, disparityR_resized;
+            if (sgm_size_ != stereo_size_) {
+                cv::resize(stereoL_rect, stereoL_resized, sgm_size_, 0., 0., cv::INTER_LINEAR);
+                cv::resize(stereoR_rect, stereoR_resized, sgm_size_, 0., 0., cv::INTER_LINEAR);
+            } else {
+                stereoL_rect.copyTo(stereoL_resized);
+                stereoR_rect.copyTo(stereoR_resized);
+            }
+
+            if (nullptr == ssgm_) {
+                spdlog::error("nullptr == ssgm_");
+                exit(1);
+            }
+            std::tie(disparityL_resized, disparityR_resized) =
+                utils::ComputeDisparity(ssgm_->get(), stereoL_resized, stereoR_resized);
+
+            if (sgm_size_ != stereo_size_) {
+                cv::resize(disparityL_resized, disparityL, stereo_size_, 0., 0., cv::INTER_CUBIC);
+                cv::resize(disparityR_resized, disparityR, stereo_size_, 0., 0., cv::INTER_CUBIC);
+                disparityL.convertTo(disparityL, CV_16U);
+                disparityR.convertTo(disparityR, CV_16U);
+            } else {
+                disparityL_resized.convertTo(disparityL, CV_16U);
+                disparityR_resized.convertTo(disparityR, CV_16U);
+            }
+            // fmt::print("ComputeDisparity end\n");
+
+            // cv_sgm_left->compute(d_stereoL_rect, d_stereoR_rect, d_disparityL);
+            // d_disparityL.download(disparityL);
+            // cv_sgm_left->compute(d_stereoR_rect, d_stereoL_rect, d_disparityR);
+            // d_disparityR.download(disparityR);
+            // cv_sgm_right->compute(stereoR_rect, stereoL_rect, disparityR);
+            // disparityL.convertTo(disparityL, CV_16S);
+            // disparityR.convertTo(disparityR, CV_16S);
+            // d_disparityL.upload(disparityL);
+            // d_disparityR.upload(disparityR);
+            // bilateral_filter_->apply(d_disparityL, d_stereoL_rect, d_disparityL);
+            // bilateral_filter_->apply(d_disparityR, d_stereoR_rect, d_disparityR);
+            // d_disparityL.download(disparityL);
+            // d_disparityR.download(disparityR);
+            // disparityR *= -16;
+        } catch (const cv::Exception& e) {
+            std::cout << "\nError in generate_depth.cpp in cv_sgm_left->compute: " << e.what()
+                      << "\ndisparity.type: " << cv::typeToString(disparityL.type())
+                      << "\ndisparity.size: " << disparityL.size() << ", types: " << cv::typeToString(CV_8UC1) << ", "
+                      << cv::typeToString(CV_16SC1) << ", " << cv::typeToString(CV_32SC1) << ", "
+                      << cv::typeToString(CV_32FC1) << "\n";
+            return false;
+        }
+        disparityL.convertTo(disparityL, CV_16S);
+        disparityR.convertTo(disparityR, CV_16S);
+        disparityL.assignTo(filtered_dispL);
+        disparityR.assignTo(filtered_dispR);
+        if (cfg_["SGM"]["subpixel"].as<bool>()) {
+            filtered_dispR *= -16;
+        }
+        try {
+            if (cfg_["DepthGeneration"]["useBilateralFilter"].as<bool>()) {
+                // apply bilateral_filter
+                cv::cuda::GpuMat d_stereoL_rect(stereoL_rect), d_stereoR_rect(stereoR_rect), d_disparity, d_disparityL,
+                    d_disparityR;
+                d_disparityL.upload(filtered_dispL);
+                d_disparityR.upload(filtered_dispR);
+                bilateral_filter_->apply(d_disparityL, d_stereoL_rect, d_disparityL);
+                bilateral_filter_->apply(d_disparityR, d_stereoR_rect, d_disparityR);
+                d_disparityL.download(filtered_dispL);
+                d_disparityR.download(filtered_dispR);
+            }
+        } catch (const cv::Exception& e) {
+            std::cout << "\nError in generate_depth.cpp in bilateral_filter->apply: " << e.what()
+                      << "\ndisparityL.type: " << cv::typeToString(disparityL.type())
+                      << "\nmapping.type: " << cv::typeToString(mapping_.type())
+                      << ", types: " << cv::typeToString(CV_8UC1) << ", " << cv::typeToString(CV_16SC1) << ", "
+                      << cv::typeToString(CV_32SC1) << ", " << cv::typeToString(CV_32FC1) << "\n";
+            return false;
+        }
+        try {
+            if (cfg_["DepthGeneration"]["useWlsFilter"].as<bool>()) {
+                wls_filter_->filter(filtered_dispL, stereoL_rect, filtered_dispL, filtered_dispR);
+            }
+        } catch (const cv::Exception& e) {
+            std::cout << "\nError in generate_depth.cpp in wls_filter_->filter: " << e.what()
+                      << "\ndisparityL.type: " << cv::typeToString(disparityL.type())
+                      << "\nmapping.type: " << cv::typeToString(mapping_.type())
+                      << ", types: " << cv::typeToString(CV_8UC1) << ", " << cv::typeToString(CV_16SC1) << ", "
+                      << cv::typeToString(CV_32SC1) << ", " << cv::typeToString(CV_32FC1) << "\n";
+            return false;
+        }
+
+        // convert to floats
+        // filtered_dispL.convertTo(filtered_dispL, CV_16SC1);
+        // filtered_dispR.convertTo(filtered_dispR, CV_16SC1);
+        filtered_dispL.assignTo(filtered_dispL, CV_32FC1);
+        filtered_dispR.assignTo(filtered_dispR, CV_32FC1);
+        if (cfg_["SGM"]["subpixel"].as<bool>()) {
+            filtered_dispL /= 16;
+            filtered_dispR /= -16;
+        }
+        disparityL.convertTo(disparityL, CV_32FC1);
+        disparityR.convertTo(disparityR, CV_32FC1);
+    }
+    duration_disparity = std::chrono::high_resolution_clock::now() - start_disparity;
+
+    // spdlog::info("disparityL({}, {}).type: {}, disparityR({}, {}).type: {}", disparityL.rows, disparityL.cols,
+    //              cv::typeToString(disparityL.type()), disparityR.rows, disparityR.cols,
+    //              cv::typeToString(disparityR.type()));
+    // cv::Mat tempL, tempR;
+    // disparityL.convertTo(tempL, CV_32FC1, 1./5000.);
+    // disparityR.convertTo(tempR, CV_32FC1, 1./5000.);
+    // cv::imshow("disparityL", tempL);
+    // cv::imshow("disparityR", tempR);
+    // cv::waitKey(0);
+
+    /// TODO: publish
+    filtered_dispL.copyTo(out_disparityL);
+    filtered_dispR.copyTo(out_disparityR);
+    // if (cfg_["DepthGeneration"]["computeDisparity"].as<bool>() and consts->saveDisparity()) {
+    //     // save disparity
+    //     std::thread saving_thread{saveImageAsDisparityPath, filtered_disp,   fpv_stereoL_stereoR_paths.stereo_l,
+    //                                 output_disparity_path,    "filtered.tiff", s};
+    //     std::thread saving_threadL{saveImageAsDisparityPath, disparityL, fpv_stereoL_stereoR_paths.stereo_l,
+    //                                 output_disparity_path,    "L.tiff",   s};
+    //     std::thread saving_threadR{saveImageAsDisparityPath, disparityR, fpv_stereoL_stereoR_paths.stereo_l,
+    //                                 output_disparity_path,    "R.tiff",   s};
+    //     saving_thread.detach();
+    //     saving_threadL.detach();
+    //     saving_threadR.detach();
+    //     // saveImageAsDisparityPath(disparity, fpv_stereoL_stereoR_paths.stereo_l, output_disparity_path,
+    //     // ".tiff",
+    //     //                          s);
+    // }
+
+    /// TODO: merge two alligned images: stereoL and fpv
+    // stereoL_rect.convertTo(stereoL_rect, fpv_rect.type());
+    // cv::addWeighted(fpv_rect, 0.5, stereoL_rect, 0.5, 0, color_img);
+    // fmt::print("c color_img.size=({}, {}),\n", color_img.size[0], color_img.size[1]);
+
+    /// TODO: publish
+    // if (consts->computeColor()) {
+    //     // std::thread saving_thread1{saveImageAsDisparityPath, fpv_undis, fpv_stereoL_stereoR_paths[1],
+    //     //                            output_fpv_undis_path, ".png", s};
+    //     saveImageAsDisparityPath(fpv_undis, fpv_stereoL_stereoR_paths.stereo_l, output_fpv_undis_path, ".png",
+    //                                 s);
+    //     saveImageAsDisparityPath(stereoL_undis, fpv_stereoL_stereoR_paths.stereo_l, output_stereoL_undis_path,
+    //                                 ".png", s);
+    //     saveImageAsDisparityPath(stereoR_undis, fpv_stereoL_stereoR_paths.stereo_r, output_stereoR_undis_path,
+    //                                 ".png", s);
+
+    //     saveImageAsDisparityPath(fpv_rect, fpv_stereoL_stereoR_paths.stereo_l, output_fpv_rect_path, ".png", s);
+    //     saveImageAsDisparityPath(stereoL_rect, fpv_stereoL_stereoR_paths.stereo_l, output_stereoL_rect_path,
+    //                                 ".png", s);
+    //     saveImageAsDisparityPath(stereoR_rect, fpv_stereoL_stereoR_paths.stereo_r, output_stereoR_rect_path,
+    //                                 ".png", s);
+    // }
+
+    // compute depth
+    start_point_cloud = std::chrono::high_resolution_clock::now();
+    cv::Mat img2d_to_coords3d_mapL, img2d_to_coords3d_mapR{};
+    cv::cuda::GpuMat d_img2d_to_coords3d_mapL, d_img2d_to_coords3d_mapR;
+    // bool handle_missing_values = true;
+    if (cfg_["DepthGeneration"]["computeDepth"].as<bool>() or cfg_["DepthGeneration"]["computePointCloud"].as<bool>()) {
+        // wls_filter_->filter(disparity,stereoL_rect,disparity,disparity);
+
+        // cv::Mat confidence = 0 * cv::Mat::ones(stereoL_rect.size(), CV_32FC1);
+        // auto filter = cv::ximgproc::createFastBilateralSolverFilter(stereoL_rect, 8.0f, 8.0f, 8.0f);
+        // filter->filter(disparity, confidence, disparity);
+        try {
+            // cv::reprojectImageTo3D(disparity, img2d_to_coords3d_map, mapping_, handle_missing_values);
+            cv::Mat mapping_float;
+            mapping_.convertTo(mapping_float, CV_32F);
+            d_filtered_dispL.upload(filtered_dispL);
+            d_filtered_dispR.upload(filtered_dispR);
+            cv::cuda::reprojectImageTo3D(d_filtered_dispL, d_img2d_to_coords3d_mapL, mapping_float, 3);
+            cv::cuda::reprojectImageTo3D(d_filtered_dispR, d_img2d_to_coords3d_mapR, mapping_float, 3);
+            d_img2d_to_coords3d_mapL.download(img2d_to_coords3d_mapL);
+            d_img2d_to_coords3d_mapR.download(img2d_to_coords3d_mapR);
+        } catch (const cv::Exception& e) {
+            std::cout << "\nError in generate_depth.cpp in reprojectImageTo3D: " << e.what()
+                      << "\ndisparityL.type: " << cv::typeToString(filtered_dispL.type())
+                      << "\ndisparityR.type: " << cv::typeToString(filtered_dispR.type())
+                      << "\nmapping.type: " << cv::typeToString(mapping_.type())
+                      << ", types: " << cv::typeToString(CV_8UC1) << ", " << cv::typeToString(CV_16SC1) << ", "
+                      << cv::typeToString(CV_32SC1) << ", " << cv::typeToString(CV_32FC1) << "\n";
+            return false;
+        }
+    }
+    duration_point_cloud = std::chrono::high_resolution_clock::now() - start_point_cloud;
+    if (cfg_["DepthGeneration"]["computeDepth"].as<bool>()) {
+        /// TODO: publish depth
+        std::vector<cv::Mat> channelsL, channelsR;
+        cv::split(img2d_to_coords3d_mapL, channelsL);
+        cv::split(img2d_to_coords3d_mapR, channelsR);
+        cv::Mat depthL = channelsL[2];
+        cv::Mat depthR = channelsR[2];
+        // std::cout << depthR;
+        // exit(0);
+        depthL.setTo(0., depthL < 0.);
+        depthR.setTo(0., depthR < 0.);
+
+        double min, max;
+        // cv::minMaxLoc(-channels[2], &min, &max);
+        min = 0.;
+        max = 10000.;
+        depthL = (depthL - min) / (max - min);
+        depthR = (depthR - min) / (max - min);
+        depthL.setTo(0., depthL > 1.);
+        depthL.setTo(0., depthL < 0.);
+        depthR.setTo(0., depthR > 1.);
+        depthR.setTo(0., depthR < 0.);
+        depthL.copyTo(out_depthL);
+        depthR.copyTo(out_depthR);
+        // channels[2].copyTo(out_depth);
+
+        // cv::imshow("after out_depth", out_depth);
+        // cv::waitKey(0);
+        // saveDepthAsDisparityPath(img2d_to_coords3d_map, fpv_stereoL_stereoR_paths.stereo_l, output_depth_path,
+        // ".tiff",
+        //                          s);
+    }
+    if (cfg_["DepthGeneration"]["computePointCloud"].as<bool>() and
+        cfg_["DepthGeneration"]["computeColor"].as<bool>()) {
+        /// TODO: publish point-cloud
+        // saveColorPointCloudAsDisparityPath(img2d_to_coords3d_map, fpv_rect, fpv_stereoL_stereoR_paths.stereo_l,
+        //                                     output_pc_path, "-color.ply", s);
+    } else if (cfg_["DepthGeneration"]["computePointCloud"].as<bool>()) {
+        // utils::multiplyChannelWise(img2d_to_coords3d_mapL, {2}, -1.);
+        // std::cout << img2d_to_coords3d_mapL;
+        // exit(0);
+        utils::removeBoundaryPoints(img2d_to_coords3d_mapL, cfg_["DepthGeneration"]["depthPadding"].as<int>());
+        Eigen::MatrixXf cloud = utils::convertPcMatToEigen(img2d_to_coords3d_mapL);
+        out_cloud = cloud;
+        // std::thread saving_thread1{savePointCloudAsDisparityPath,
+        //                             img2d_to_coords3d_map,
+        //                             fpv_stereoL_stereoR_paths.stereo_l,
+        //                             output_pc_path,
+        //                             ".ply",
+        //                             s};
+        // saving_thread1.detach();
+    }
+
+    // fmt::print("duration_rectify={}\nduration_disparity={}\nduration_point_cloud={}\n", duration_rectify.count(),
+    //            duration_disparity.count(), duration_point_cloud.count());
+
+    return true;
 }
 
 }  // namespace tools

@@ -22,7 +22,7 @@ function(print_recognized_opencv_modules MODULES)
     endforeach()
 endfunction(print_recognized_opencv_modules)
 
-set(VERSION 4.9.0)
+set(VERSION 4.7.0)
 
 if(USE_SYSTEM_LIBS)
     find_package(OpenCV ${VERSION})

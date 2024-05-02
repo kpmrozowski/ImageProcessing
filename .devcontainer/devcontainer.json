@@ -6,7 +6,7 @@
 			"DOMAIN_ID": "19"
 		}
 	},
-	"remoteUser": "jetbot",
+	"remoteUser": "turtle",
 	"runArgs": [
 		"--network=host",
 		"--privileged",
@@ -15,9 +15,9 @@
 		"--security-opt=seccomp:unconfined",
 		"--security-opt=apparmor:unconfined",
 		"--volume=/tmp/.X11-unix:/tmp/.X11-unix",
-		"--volume=/dev:/dev",
-		"--volume=/home/k.mrozowski/dev:/home/jetbot/dev",
-		"--volume=/home/k.mrozowski/.ssh:/home/jetbot/.ssh"
+		"--volume=/dev/:/dev/",
+		"--volume=/home/k.mrozowski/dev/:/home/turtle/dev/",
+		"--volume=/home/k.mrozowski/.ssh/:/home/turtle/.ssh/"
 	],
 	"containerEnv": {
 		"NVIDIA_DRIVER_CAPABILITIES": "all",
@@ -43,7 +43,7 @@
 				"ms-azuretools.vscode-docker",
 				"ms-python.python",
 				"llvm-vs-code-extensions.vscode-clangd",
-				  "xaver.clang-format",
+				"xaver.clang-format",
 				"redhat.vscode-yaml",
 				"smilerobotics.urdf",
 				"streetsidesoftware.code-spell-checker",

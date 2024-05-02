@@ -1,14 +1,22 @@
 #include "depth_generator/utils.hpp"
 
+#include <exception>
+#include <execution>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <opencv2/core/check.hpp>
 #include <sstream>
 
 #include <fmt/format.h>
 #include <libsgm.h>
 #include <spdlog/spdlog.h>
+#include <yaml-cpp/node/node.h>
 #include <yaml-cpp/yaml.h>
+#include <Eigen/Core>
 #include <opencv2/calib3d.hpp>
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -67,21 +75,39 @@ void utils::createDirectories(std::vector<std::string>&& paths) {
 }
 
 nlohmann::json utils::readJson(const std::string& path) {
-    std::ifstream file(path);
-    if (file.fail()) {
-        spdlog::error("Failed to open (read) {}", path);
-        std::exit(EXIT_FAILURE);
+    int num_tries = 0;
+    if (not fs::exists(path)) {
+        spdlog::error("path does not exist: '{}'", path);
+        exit(1);
     }
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    nlohmann::json data = nlohmann::json::parse(buffer.str());
-    return data;
+    if (fs::is_directory(path)) {
+        spdlog::error("path is not a file: '{}'", path);
+        exit(1);
+    }
+    while (num_tries < 20) {
+        try {
+            spdlog::info("Reading json: '{}'", path);
+            std::ifstream file;
+            file.open(path);
+            if (file.fail()) {
+                spdlog::error("Failed to open (read) '{}'", path);
+                std::exit(EXIT_FAILURE);
+            }
+            nlohmann::json data = nlohmann::json::parse(file);
+            spdlog::info("Successfully parsed json.");
+            return data;
+        } catch (...) {
+            ++num_tries;
+        }
+    }
+    spdlog::error("error reading json: '{}'", path);
+    exit(1);
 }
 
 // =============================================================
 // ========================= FUNCTIONS =========================
 
-sgm::StereoSGM utils::CreateStereoSGM(const YAML::Node& cfg) {
+sgm::StereoSGM& utils::CreateStereoSGM(const YAML::Node& cfg) {
     sgm::PathType pathType = sgm::PathType::SCAN_4PATH;
     switch (cfg["SGM"]["numPaths"].as<int>()) {
         case 4:
@@ -91,7 +117,8 @@ sgm::StereoSGM utils::CreateStereoSGM(const YAML::Node& cfg) {
             pathType = sgm::PathType::SCAN_8PATH;
             break;
         default:
-            throw std::invalid_argument("numPaths can be equal 4 or 8");
+            spdlog::error("numPaths can be equal 4 or 8");
+            exit(1);
     }
 
     sgm::CensusType censusType = sgm::CensusType::CENSUS_9x7;
@@ -102,14 +129,50 @@ sgm::StereoSGM utils::CreateStereoSGM(const YAML::Node& cfg) {
         case 1:
             censusType = sgm::CensusType::SYMMETRIC_CENSUS_9x7;
             break;
-        default:
-            throw std::invalid_argument("censusType can be equal 0 or 1");
+        default: {
+            spdlog::error("censusType can be equal 0 or 1");
+            exit(1);
+        }
     }
 
     static constexpr int kStereoBits = 8;
     static constexpr int kDisparityBits = 16;
+
     // clang-format off
-    return {
+    spdlog::info(
+      "sgm::StereoSGM:"
+      "\n\twidth: {}"
+      "\n\theight: {}"
+      "\n\tdisparity_size: {}"
+      "\n\tinput_depth_bits: {}"
+      "\n\toutput_depth_bits: {}"
+      "\n\tinout_type: {}"
+      "\n\t\tparameters.P1: {}"
+      "\n\t\tparameters.P2: {}"
+      "\n\t\tparameters.uniqueness: {}"
+      "\n\t\tparameters.subpixel: {}"
+      "\n\t\tparameters.path_type: {}"
+      "\n\t\tparameters.min_disp: {}"
+      "\n\t\tparameters.LR_max_diff: {}"
+      "\n\t\tparameters.census_type: {}",
+      cfg["SGM"]["imgWidth"].as<int>(),
+      cfg["SGM"]["imgHeight"].as<int>(),
+      cfg["SGM"]["disparitySize"].as<int>(),
+      kStereoBits,
+      kDisparityBits,
+      sgm::EXECUTE_INOUT_HOST2HOST,
+      // parameters
+      cfg["SGM"]["p1"].as<int>(),
+      cfg["SGM"]["p2"].as<int>(),
+      cfg["SGM"]["uniqueness"].as<float>(),
+      cfg["SGM"]["subpixel"].as<bool>(),
+      pathType,
+      cfg["SGM"]["minimalDisparity"].as<int>(),
+      cfg["SGM"]["lrMaxDiff"].as<int>(),
+      censusType
+      );
+
+    static sgm::StereoSGM ssgm{
         cfg["SGM"]["imgWidth"].as<int>(),
         cfg["SGM"]["imgHeight"].as<int>(),
         cfg["SGM"]["disparitySize"].as<int>(),
@@ -127,6 +190,7 @@ sgm::StereoSGM utils::CreateStereoSGM(const YAML::Node& cfg) {
             censusType
         }
     };
+    return ssgm;
     // clang-format on
 }
 
@@ -134,20 +198,20 @@ std::pair<cv::Mat, cv::Mat> utils::ComputeDisparity(sgm::StereoSGM& ssgm, const 
                                                     const cv::Mat& stereoR_raw) {
     static constexpr int kInvalidDisparityValue = 65520;
 
-    cv::Mat stereoL_rect{1, 1, CV_8U}, stereoR_rect{1, 1, CV_8U};
+    cv::Mat stereoL_rect{stereoL_raw.size(), CV_8U}, stereoR_rect{stereoR_raw.size(), CV_8U};
     stereoL_raw.convertTo(stereoL_rect, CV_8U);
     stereoR_raw.convertTo(stereoR_rect, CV_8U);
+
     cv::Mat disparityL(stereoL_rect.size(), CV_16U), disparityR(stereoR_rect.size(), CV_16U);
     try {
-        // cv::cuda::GpuMat d_stereoL(stereoL_rect), d_stereoR(stereoR_rect), d_disparity;
-        // ssgm.execute(d_stereoL.data, d_stereoR.data, d_disparity);
         ssgm.execute(stereoL_rect.data, stereoR_rect.data, disparityL.data, disparityR.data);
-        // d_disparity.download(disparity);
     } catch (const cv::Exception& e) {
         if (e.code == cv::Error::GpuNotSupported) {
-            throw std::runtime_error("generate_depth, libSGM: GpuNotSupported");
+            spdlog::error("generate_depth, libSGM: GpuNotSupported");
+            exit(1);
         } else {
-            throw std::runtime_error(e.what());
+            spdlog::error("generate_depth: {}", e.what());
+            exit(2);
         }
     }
     // create mask for invalid disp
@@ -282,6 +346,60 @@ void utils::savePointCloud(cv::InputArray pc_to_save, const std::string& stereo_
     // fmt::print("'{}' saved\n", file_path);
 }
 
+void utils::multiplyChannelWise(cv::Mat& img, std::vector<int> channel_ids, double value) {
+    std::vector<cv::Mat> channels;
+    cv::split(img, channels);
+    for (int id : channel_ids) {
+        channels[id] *= value;
+    }
+    cv::merge(channels, img);
+}
+
+void utils::removeBoundaryPoints(cv::Mat& img, const int padding) {
+    if (padding == 0) {
+        return;
+    }
+    std::vector<cv::Mat> channels;
+    cv::split(img, channels);
+    const int cols = channels.front().cols;
+    const int rows = channels.front().rows;
+    const cv::Rect roiN(0, 0, cols, padding);
+    const cv::Rect roiE(cols - padding, padding, padding, rows - 2 * padding);
+    const cv::Rect roiS(0, rows - padding, cols, padding);
+    const cv::Rect roiW(0, padding, padding, rows - 2 * padding);
+    channels[2](roiN) = 0.;
+    channels[2](roiE) = 0.;
+    channels[2](roiS) = 0.;
+    channels[2](roiW) = 0.;
+    cv::merge(channels, img);
+}
+
+Eigen::Matrix3Xf utils::convertPcMatToEigen(const cv::Mat& pcMat) {
+    const size_t pcSize = std::count_if(
+        std::execution::par, pcMat.begin<cv::Vec3f>(), pcMat.end<cv::Vec3f>(), [](const cv::Vec3f& point) -> bool {
+            if (std::isinf(point[0]) or std::isinf(point[1]) or std::isinf(point[2]) or point[2] <= 0.) {
+                return false;
+            }
+            return true;
+        });
+
+    Eigen::Matrix3Xf cloud = Eigen::Matrix3Xf::Zero(3, pcSize);
+
+    size_t pointId = 0;
+    for (int row = 0; row < pcMat.rows; ++row) {
+        for (int col = 0; col < pcMat.cols; ++col) {
+            if (std::isinf(pcMat.at<cv::Vec3f>(row, col)[0]) or std::isinf(pcMat.at<cv::Vec3f>(row, col)[1]) or
+                std::isinf(pcMat.at<cv::Vec3f>(row, col)[2]) or pcMat.at<cv::Vec3f>(row, col)[2] <= 0.) {
+                continue;
+            }
+            const cv::Vec3f& cvPoint = pcMat.at<cv::Vec3f>(row, col);
+            cloud.col(pointId) = Eigen::Vector3f{cvPoint[2], cvPoint[0], cvPoint[1]};
+            ++pointId;
+        }
+    }
+    return cloud;
+}
+
 void utils::saveLaserScan(cv::InputArray pc_to_save, const std::string& stereo_imag_path,
                           const std::string output_folder_path, std::string file_format) {
     cv::Mat pc_mat = pc_to_save.getMat();
@@ -338,7 +456,7 @@ void utils::saveLaserScan(cv::InputArray pc_to_save, const std::string& stereo_i
 
 void utils::DetermineResultsPath(std::string& results_path) {
     int results_path_id = 0;
-    while (std::filesystem::is_directory(results_path + fmt::format("-v{:02}/", results_path_id))) {
+    while (fs::is_directory(results_path + fmt::format("-v{:02}/", results_path_id))) {
         ++results_path_id;
     }
     results_path += fmt::format("-v{:02}/", results_path_id);
@@ -474,62 +592,73 @@ static void utils::saveMapPointsAndTrajectories(const OrbSlam3Wrapper& slam, con
 }
 #endif
 
-Rectification utils::PerformRectification(const CamSysCalib& calib) {
-    spdlog::info("Performing rectification");
-
-    std::cout << "Calibration rgb:\n"
-              << calib.rgb.intrinsics << "\n"
-              << calib.rgb.distortion << "\n"
-              << calib.rgb.rotation << "\n"
-              << calib.rgb.translation << "\n"
-              << "Calibration stereoL_rect:\n"
-              << calib.stereoL_rect.intrinsics << "\n"
-              << calib.stereoL_rect.distortion << "\n"
-              << calib.stereoL_rect.rotation << "\n"
-              << calib.stereoL_rect.translation << "\n"
-              << "Calibration stereoR_rect:\n"
-              << calib.stereoR_rect.intrinsics << "\n"
-              << calib.stereoR_rect.distortion << "\n"
-              << calib.stereoR_rect.rotation << "\n"
-              << calib.stereoR_rect.translation << "\n";
-
-    // =========================================================
-    // ==================== COMPUTING DEPTH ====================
-
-    MonoCalibration gray_calib{};
+static void getMonoCalibration(MonoCalibration& out, const CamSysCalib& calib) {
     if constexpr (kFitLeftStereoToRgb) {
-        gray_calib.intrinsics = calib.stereoL_rect.intrinsics;
-        gray_calib.distortion = calib.stereoL_rect.distortion;
-        gray_calib.rotation = calib.stereoL_rect.rotation;
-        gray_calib.translation = calib.stereoL_rect.translation;
+        out.intrinsics = calib.stereoL_rect.intrinsics;
+        out.distortion = calib.stereoL_rect.distortion;
+        out.rotation = calib.stereoL_rect.rotation;
+        out.translation = calib.stereoL_rect.translation;
         // gray_calib.translation = cv::Mat_<double>{7.5456632900812878e-02, 0, 0};
     } else {
-        gray_calib.intrinsics = calib.stereoR_rect.intrinsics;
-        gray_calib.distortion = calib.stereoR_rect.distortion;
-        gray_calib.rotation = calib.stereoR_rect.rotation;
-        gray_calib.translation = calib.stereoR_rect.translation;
+        out.intrinsics = calib.stereoR_rect.intrinsics;
+        out.distortion = calib.stereoR_rect.distortion;
+        out.rotation = calib.stereoR_rect.rotation;
+        out.translation = calib.stereoR_rect.translation;
         // gray_calib.translation = cv::Mat_<double>{-2.4666640199322742e-02, 0, 0};
     }
-    cv::invert(gray_calib.rotation, gray_calib.rotation);
-    gray_calib.translation = -gray_calib.translation;
-    gray_calib.translation.at<double>(1, 0) = 0;
-    gray_calib.translation.at<double>(2, 0) = 0;
-    cv::Size image_size;
-    if constexpr (kFitImagesToStereo) {
-        image_size = kStereoResol;
-    } else {
-        image_size = kRgbResol;
-    }
+    out.translation = -out.translation;
+    out.translation.at<double>(1, 0) = 0;
+    out.translation.at<double>(2, 0) = 0;
+}
 
-    cv::Mat rgb_rectification(3, 3, CV_64F);
-    cv::Mat gray_rectification(3, 3, CV_64F);
-    cv::Mat rgb_projectionMat(3, 4, CV_64F);
-    cv::Mat gray_projectionMat(3, 4, CV_64F);
-    cv::Mat mapping(4, 4, CV_64F);
+static void getOptimizedCameraMatrix(cv::InputOutputArray out, const MonoCalibration& gray_calib,
+                                     const cv::Size& image_size, const cv::Size& stereo_resol) {
+    cv::Mat mat;
+    if constexpr (kFitImagesToStereo) {
+        cv::Rect gray_valid_pix_roi_2;
+        if (gray_calib.intrinsics.empty() or gray_calib.distortion.empty()) {
+            spdlog::info("empty");
+        }
+        spdlog::info("getOptimalNewCameraMatrix");
+        std::cout << "gray_calib.intrinsics:" << gray_calib.intrinsics << "\n"
+                  << "gray_calib.distortion: " << gray_calib.distortion << "\n"
+                  << "stereo_resol: " << stereo_resol << "\n"
+                  << "image_size: " << image_size << "\n";
+        mat = cv::getOptimalNewCameraMatrix(gray_calib.intrinsics, gray_calib.distortion, stereo_resol, 1.0, image_size,
+                                            &gray_valid_pix_roi_2);
+    } else {
+        cv::Rect rgb_valid_pix_roi_2;
+        if (gray_calib.intrinsics.empty() or gray_calib.distortion.empty()) {
+            spdlog::info("empty");
+        }
+        mat = cv::getOptimalNewCameraMatrix(gray_calib.intrinsics, gray_calib.distortion, stereo_resol, 1.0, image_size,
+                                            &rgb_valid_pix_roi_2);
+    }
+    spdlog::info("after getOptimalNewCameraMatrix");
+    out.assign(mat);
+    spdlog::info("after assign");
+}
+
+struct StereoRectifyOut {
+    cv::Mat rgb_rectification;   //(3, 3, CV_64F);
+    cv::Mat gray_rectification;  //(3, 3, CV_64F);
+    cv::Mat rgb_projectionMat;   //(3, 4, CV_64F);
+    cv::Mat gray_projectionMat;  //(3, 4, CV_64F);
+    cv::Mat mapping;             //(4, 4, CV_64F);
     cv::Rect rgb_valid_pix_roi_1;
     cv::Rect gray_valid_pix_roi_1;
+    StereoRectifyOut()
+            : rgb_rectification(3, 3, CV_64F)
+            , gray_rectification(3, 3, CV_64F)
+            , gray_projectionMat(3, 4, CV_64F)
+            , mapping(4, 5, CV_64F)
+            , rgb_valid_pix_roi_1()
+            , gray_valid_pix_roi_1() {
+    }
+};
 
-    spdlog::info("stereoRectify");
+static void performStereoRectify(StereoRectifyOut& sr, const CamSysCalib& calib, const MonoCalibration& gray_calib,
+                                 const cv::Size& image_size, const cv::Size& stereo_resol) {
     std::cout << "calib.rgb.intrinsics:\n"
               << calib.rgb.intrinsics << "\n"
               << "calib.rgb.distortion:\n"
@@ -543,100 +672,101 @@ Rectification utils::PerformRectification(const CamSysCalib& calib) {
               << "gray_calib.rotation:\n"
               << gray_calib.rotation << "\n"
               << "gray_calib.translation:\n"
-              << gray_calib.translation << "\n";
+              << gray_calib.translation << "\n"
+              << "s.stereo_resol:\n"
+              << stereo_resol << "\n";
     spdlog::info("stereoRectify start");
-    cv::Mat_<double> zero_distorions{0, 0, 0, 0, 0};
-    cv::stereoRectify(gray_calib.intrinsics.clone(),   // Input
-                      zero_distorions,                 // gray_calib.distortion.clone(),   // Input
-                      calib.rgb.intrinsics.clone(),    // Input
-                      zero_distorions,                 // calib.rgb.distortion.clone(),    // Input
-                      image_size,                      // Input
-                      gray_calib.rotation.clone(),     // Input
-                      gray_calib.translation.clone(),  // Input
-                      gray_rectification,              // Output
-                      rgb_rectification,               // Output
-                      gray_projectionMat,              // Output
-                      rgb_projectionMat,               // Output
-                      mapping,                         // Output
-                      cv::CALIB_ZERO_DISPARITY,        // Input
-                      1.0,                             // Input
-                      kStereoResol,                    // Input
-                      &gray_valid_pix_roi_1,           // Output
-                      &rgb_valid_pix_roi_1             // Output
+
+    cv::stereoRectify(gray_calib.intrinsics,     // Input
+                      gray_calib.distortion,     // Input
+                      calib.rgb.intrinsics,      // Input
+                      calib.rgb.distortion,      // Input
+                      image_size,                // Input
+                      gray_calib.rotation,       // Input
+                      gray_calib.translation,    // Input
+                      sr.gray_rectification,     // Output
+                      sr.rgb_rectification,      // Output
+                      sr.gray_projectionMat,     // Output
+                      sr.rgb_projectionMat,      // Output
+                      sr.mapping,                // Output
+                      cv::CALIB_ZERO_DISPARITY,  // Input
+                      1.0,                       // Input
+                      stereo_resol,              // Input
+                      &sr.gray_valid_pix_roi_1,  // Output
+                      &sr.rgb_valid_pix_roi_1    // Output
     );
-    spdlog::info("getOptimalNewCameraMatrix gray\n");
-    cv::Rect gray_valid_pix_roi_2;
-    cv::Mat new_gray_intrinsics =
-        cv::getOptimalNewCameraMatrix(gray_calib.intrinsics, zero_distorions,  // gray_calib.distortion,
-                                      kStereoResol, 1.0, image_size, &gray_valid_pix_roi_2);
-    spdlog::info("getOptimalNewCameraMatrix rgb\n");
-    cv::Rect rgb_valid_pix_roi_2;
-    cv::Mat new_rgb_intrinsics =
-        cv::getOptimalNewCameraMatrix(gray_calib.intrinsics, zero_distorions,  // gray_calib.distortion,
-                                      kStereoResol, 1.0, image_size, &rgb_valid_pix_roi_2);
-
-    cv::Mat new_intrinsics;
-    if constexpr (kFitImagesToStereo) {
-        new_intrinsics = new_gray_intrinsics;
-        // new_intrinsics = gray_projectionMat;
-    } else {
-        new_intrinsics = new_rgb_intrinsics;
-        // new_intrinsics = rgb_projectionMat;
-    }
-
-    spdlog::info("initUndistortRectifyMap rgb\n");
-    cv::Mat rgb_map_1, rgb_map_2;
-    cv::initUndistortRectifyMap(calib.rgb.intrinsics, zero_distorions, /*calib.rgb.distortion*/ rgb_rectification,
-                                new_intrinsics, image_size, CV_32FC2, rgb_map_1, rgb_map_2);
-
-    spdlog::info("initUndistortRectifyMap gray\n");
-    cv::Mat gray_map_1, gray_map_2;
-    cv::initUndistortRectifyMap(gray_calib.intrinsics, zero_distorions, /*gray_calib.distortion*/ gray_rectification,
-                                new_intrinsics, image_size, CV_32FC2, gray_map_1, gray_map_2);
-
-    mapping.at<double>(4, 3) *= -1;
-    mapping.at<double>(4, 4) *= -1;
-    mapping.at<double>(3, 4) *= -1;
-    std::cout << "new_intrinsics:\n"
-              << new_intrinsics << "\n"
-              << "new_gray_calib.intrinsics:\n"
-              << new_gray_intrinsics << "\n\n"
+    sr.mapping.at<double>(4, 3) *= -1;
+    sr.mapping.at<double>(4, 4) *= -1;
+    sr.mapping.at<double>(3, 4) *= -1;
+    std::cout << "gray_calib.intrinsics:\n"
+              << gray_calib.intrinsics << "\n"
               << "rgb_rectification:\n"
-              << rgb_rectification << "\n"
+              << sr.rgb_rectification << "\n"
               << "gray_rectification:\n"
-              << gray_rectification << "\n"
+              << sr.gray_rectification << "\n"
               << "rgb_projectionMat:\n"
-              << rgb_projectionMat << "\n"
+              << sr.rgb_projectionMat << "\n"
               << "gray_projectionMat:\n"
-              << gray_projectionMat << "\n"
+              << sr.gray_projectionMat << "\n"
               << "mapping:\n"
-              << mapping << "\n\n"
-              << "rgb_valid_pix_roi_2:\n"
-              << rgb_valid_pix_roi_2 << "\n"
-              << "gray_valid_pix_roi_2:\n"
-              << gray_valid_pix_roi_2 << "\n"
-              << "\n"
-              << "rgb_map_1(" << rgb_map_1.size.dims() << ").size=(" << rgb_map_1.size[0] << ", " << rgb_map_1.size[1]
-              << ")\n"
-              << "rgb_map_2(" << rgb_map_2.size.dims() << ").size=(" << rgb_map_2.size[0] << ", " << rgb_map_2.size[1]
-              << ")\n"
-              << "gray_map_1(" << gray_map_1.size.dims() << ").size=(" << gray_map_1.size[0] << ", "
-              << gray_map_1.size[1] << ")\n"
-              << "gray_map_2(" << gray_map_2.size.dims() << ").size=(" << gray_map_2.size[0] << ", "
-              << gray_map_2.size[1] << ")\n";
-
-    Rectification r{kStereoResol};
-    r.rgb_map_1 = rgb_map_1;
-    r.rgb_map_2 = rgb_map_2;
-    r.gray_map_1 = gray_map_1;
-    r.gray_map_2 = gray_map_2;
-    r.new_intrinsics = new_intrinsics;
-    return r;
+              << sr.mapping << "\n";
 }
 
-CamSysCalib utils::LoadCalibration(const std::string& path) {
-    spdlog::info("Loading CamSysCalib");
-    CamSysCalib calib{};
+static Rectification performInitUndistortRectifyMap(Rectification& out, const CamSysCalib& calib,
+                                                    const MonoCalibration& gray_calib, const cv::Mat& new_intrinsics,
+                                                    const cv::Size& image_size, const cv::Size& stereo_resol) {
+    spdlog::info("performStereoRectify");
+    StereoRectifyOut sr;
+    performStereoRectify(sr, calib, gray_calib, image_size, stereo_resol);
+
+    std::cout << "calib.rgb.intrinsics:\n"
+              << calib.rgb.intrinsics << "\n"
+              << "calib.rgb.distortion:\n"
+              << calib.rgb.distortion << "\n";
+    spdlog::info("================================");
+    cv::initUndistortRectifyMap(calib.rgb.intrinsics, calib.rgb.distortion, sr.rgb_rectification, new_intrinsics,
+                                image_size, CV_32FC2, out.rgb_map_1, out.rgb_map_2);
+
+    std::cout << "gray_calib.intrinsics:\n"
+              << gray_calib.intrinsics << "\n"
+              << "gray_calib.distortion:\n"
+              << gray_calib.distortion << "\n";
+    cv::initUndistortRectifyMap(gray_calib.intrinsics, gray_calib.distortion, sr.gray_rectification, new_intrinsics,
+                                image_size, CV_32FC2, out.gray_map_1, out.gray_map_2);
+
+    out.new_intrinsics = new_intrinsics.clone();
+
+    std::cout << "rgb_map_1(" << out.rgb_map_1.size.dims() << ").size=(" << out.rgb_map_1.size[0] << ", "
+              << out.rgb_map_1.size[1] << ")\n"
+              << "rgb_map_2(" << out.rgb_map_2.size.dims() << ").size=(" << out.rgb_map_2.size[0] << ", "
+              << out.rgb_map_2.size[1] << ")\n"
+              << "gray_map_1(" << out.gray_map_1.size.dims() << ").size=(" << out.gray_map_1.size[0] << ", "
+              << out.gray_map_1.size[1] << ")\n"
+              << "gray_map_2(" << out.gray_map_2.size.dims() << ").size=(" << out.gray_map_2.size[0] << ", "
+              << out.gray_map_2.size[1] << ")\n";
+    return out;
+}
+
+void utils::PerformRectification(Rectification& rectification, const CamSysCalib& calib, const YAML::Node& cfg) {
+    const cv::Size stereo_resol{cfg["stereoWidth"].as<int>(), cfg["stereoHeight"].as<int>()};
+    const cv::Size rgb_resol{cfg["rgbWidth"].as<int>(), cfg["rgbHeight"].as<int>()};
+
+    cv::Size image_size{};
+    if constexpr (kFitImagesToStereo) {
+        image_size = stereo_resol;
+    } else {
+        image_size = rgb_resol;
+    }
+    MonoCalibration gray_calib;
+    getMonoCalibration(gray_calib, calib);
+
+    cv::Mat new_intrinsics(3, 3, CV_64F);
+    getOptimizedCameraMatrix(new_intrinsics, gray_calib, image_size, stereo_resol);
+
+    performInitUndistortRectifyMap(rectification, calib, gray_calib, new_intrinsics, image_size, stereo_resol);
+}
+
+void utils::LoadCalibration(CamSysCalib& calib, const std::string& path) {
     nlohmann::json data = utils::readJson(path);
     calib.rgb.intrinsics = cv::Mat(data["intrinsics_calib_rgb"]["data"].get<std::vector<double>>(), true).reshape(0, 3);
     calib.rgb.distortion = cv::Mat(data["distortion_calib_rgb"]["data"].get<std::vector<double>>(), true);
@@ -661,18 +791,12 @@ CamSysCalib utils::LoadCalibration(const std::string& path) {
 
     calib.stereoL_stereoR_transform =
         cv::Mat(data["transformation_calib_ir1_calib_ir2"]["data"].get<std::vector<double>>(), true);
-
-    return calib;
 }
 
-cv::Mat utils::PrepareImagesMapping(const CamSysCalib& calib) {
-    // double baseline = 79.401115; // baseline
-    const double Tx = calib.stereoL_stereoR_transform.at<double>(0, 3) * 1342;
-    // [1, 0, 0,     -cx1,
-    //  0, 1, 0,     -cy,
-    //  0, 0, 0,      f,
-    //  0, 0, -1/Tx,  (cx1-cx2)/Tx ]
-    cv::Mat mapping = cv::Mat::zeros(4, 4, CV_64F);
+cv::Mat utils::ComputeProjectionMatrix(const CamSysCalib& calib) {
+    cv::Mat mapping(4, 4, CV_64F);
+
+    const double Tx = calib.stereoL_stereoR_transform.at<double>(0, 3);
     mapping.at<double>(0, 0) = 1;
     mapping.at<double>(1, 1) = 1;
     mapping.at<double>(3, 2) = -1 / Tx;
@@ -681,9 +805,7 @@ cv::Mat utils::PrepareImagesMapping(const CamSysCalib& calib) {
     mapping.at<double>(2, 3) = -calib.stereoL_rect.intrinsics.at<double>(0, 0);
     mapping.at<double>(3, 3) =
         (calib.stereoL_rect.intrinsics.at<double>(0, 2) - calib.stereoR_rect.intrinsics.at<double>(0, 2)) / Tx;
-
     std::cout << "my_mapping:\n" << mapping << "\n";
-
     return mapping;
 }
 
